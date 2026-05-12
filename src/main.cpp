@@ -30,12 +30,14 @@ LED 2     -> GPIO 33
 #define OVERHEAT_THRESHOLD 35.0
 #define DEBOUNCE_MS 300
 #define MAX_FAILURE 3
+#define FILTER_SAMPLES 5
 
 DHT dht(DHTPIN, DHTTYPE);
 
 typedef struct {
     float temperature;
     float humidity;
+    int adcFiltered;
     int adcRaw;
     float setpoint;
     bool relayOn;
@@ -78,9 +80,22 @@ void IRAM_ATTR onButton2Press() {
 
 
 // reading whats set by the user via adc
-int readADC() {
+int readRawADC() {
     int raw = analogRead(POT_PIN);  // reads 0-4095
     return raw;
+}
+
+int readADC(){
+    int total = 0;
+    int average = 0;
+
+    for(int i =0; i < FILTER_SAMPLES; i++){
+        total += analogRead(POT_PIN);
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    average = total / FILTER_SAMPLES;
+    return average;
 }
 
 float calibrateADC(int raw) {
@@ -292,12 +307,17 @@ void adcTask(void *pvParameters) {
         }
 
         xSemaphoreTake(stateMutex, portMAX_DELAY);
-        systemState.adcRaw = readADC();
-        systemState.setpoint = calibrateADC(systemState.adcRaw);
+        systemState.adcRaw = readRawADC();
+        systemState.adcFiltered = readADC();
+        systemState.setpoint = calibrateADC(systemState.adcFiltered);
         xSemaphoreGive(stateMutex);
 
         Serial.print("ADC Raw: ");
         Serial.println(systemState.adcRaw);
+        Serial.print("ADC Filtered: ");
+        Serial.println(systemState.adcFiltered);
+
+
         Serial.print("Setpoint: ");
         Serial.print(systemState.setpoint);
         Serial.println(" C");
