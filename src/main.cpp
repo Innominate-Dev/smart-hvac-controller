@@ -28,6 +28,7 @@ LED 2     -> GPIO 33
 
 #define OVERHEAT_THRESHOLD 35.0
 #define DEBOUNCE_MS 300
+#define MAX_FAILURE 3
 
 DHT dht(DHTPIN, DHTTYPE);
 
@@ -38,6 +39,8 @@ typedef struct {
     float setpoint;
     bool relayOn;
     bool alarmActive;
+    int failureCount;
+    float lastTemperature;
 } SystemState_t;
 
 SystemState_t systemState;
@@ -96,7 +99,12 @@ void buttonTask(void *pvParameters){
         if (button2Pressed) {
             button2Pressed = false;  // reset flag
             Serial.println("Button 2: Mode Switch!");
-            // toggle relay
+
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
+            systemState.failureCount = 0;
+            xSemaphoreGive(stateMutex);
+
+            // toggles relay //
             xSemaphoreTake(stateMutex, portMAX_DELAY);
             systemState.relayOn = !systemState.relayOn;
             digitalWrite(RELAY_PIN, systemState.relayOn);
@@ -109,6 +117,7 @@ void buttonTask(void *pvParameters){
 
 void safetyTask(void *pvParameters){
     while(1) {
+
         xSemaphoreTake(stateMutex, portMAX_DELAY);
         float temp = systemState.temperature;
         xSemaphoreGive(stateMutex);
@@ -142,18 +151,43 @@ void safetyTask(void *pvParameters){
 void sensorTask(void *pvParameters) {
     while(1) {
         Serial.println("Reading sensor...");
-
+        
         float temperature, humidity;
         xSemaphoreTake(stateMutex, portMAX_DELAY); //locking so one thread can access our data
+        systemState.lastTemperature = systemState.temperature;
+
         systemState.humidity = dht.readHumidity();
         systemState.temperature = dht.readTemperature();
-        
-        if (isnan(systemState.temperature) || isnan(systemState.humidity)) 
-        {
-            xSemaphoreGive(stateMutex); // unlocking
+
+
+        // check for failed reading
+        if (isnan(systemState.temperature) || isnan(systemState.humidity)) {
+            systemState.failureCount++;
+            xSemaphoreGive(stateMutex);
             Serial.println("ERROR: Sensor read failed!");
+
+            // check if too many failures
+            if (systemState.failureCount >= MAX_FAILURE) {
+                Serial.println("CRITICAL: Too many failures - shutting down!");
+                digitalWrite(RELAY_PIN, LOW);
+                ledcWriteTone(0, 2000);
+                digitalWrite(LED_ALARM_PIN, HIGH);
+            }
+
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
+        }
+
+        // Anomoly detection  
+        if (abs(systemState.lastTemperature - systemState.temperature) > 10 )
+        {
+            Serial.println("WARNING: Anomoly detected - Rejecting sensor reading");
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
+            systemState.temperature = systemState.lastTemperature;
+            xSemaphoreGive(stateMutex);
+        }
+        else{
+            systemState.failureCount = 0;
         }
         
         xSemaphoreGive(stateMutex); // unlocking
