@@ -17,9 +17,16 @@ LED 2     -> GPIO 33
 #include "DHT.h"
 #include "freertos/semphr.h"
 
+// Defining our pin ports
 #define DHTTYPE DHT22
 #define DHTPIN 16
 #define POT_PIN 34
+#define RELAY_PIN 26
+#define BUZZER_PIN 27
+#define LED_ALARM_PIN 33
+#define LED_STATUS_PIN 25
+
+#define OVERHEAT_THRESHOLD 35.0
 
 DHT dht(DHTPIN, DHTTYPE);
 
@@ -49,6 +56,34 @@ float calibrateADC(int raw) {
     return calibrated;
 }
 
+void safetyTask(void *pvParameters){
+    while(1) {
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        float temp = 40.0;
+        xSemaphoreGive(stateMutex);
+
+        if(temp > OVERHEAT_THRESHOLD){
+            tone(BUZZER_PIN, 2000); // THIS MAKES A WARNING NOISE
+            digitalWrite(RELAY_PIN, LOW); // Turn off our RELAY
+            // digitalWrite(LED_ALARM_PIN, HIGH); // Turn on our alarmss
+            ledcWriteTone(0, 2000);
+            systemState.alarmActive = true;
+            Serial.println("WARNING: Overheating detected");
+        }
+        else{
+            // noTone(BUZZER_PIN); // //Turns off alarm
+            ledcWriteTone(0, 0);
+            digitalWrite(RELAY_PIN, HIGH); // Turn off our RELAY
+            digitalWrite(LED_ALARM_PIN, LOW); // Turn on our alarmss
+
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
+            systemState.alarmActive = false;
+            xSemaphoreGive(stateMutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
 void sensorTask(void *pvParameters) {
     while(1) {
         Serial.println("Reading sensor...");
@@ -60,6 +95,7 @@ void sensorTask(void *pvParameters) {
         
         if (isnan(systemState.temperature) || isnan(systemState.humidity)) 
         {
+            xSemaphoreGive(stateMutex); // unlocking
             Serial.println("ERROR: Sensor read failed!");
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
@@ -99,6 +135,16 @@ void setup() {
     stateMutex = xSemaphoreCreateMutex();
     Serial.begin(115200);
     dht.begin();
+
+    pinMode(RELAY_PIN, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(LED_ALARM_PIN, OUTPUT);
+    pinMode(LED_STATUS_PIN, OUTPUT);
+
+    ledcAttachPin(BUZZER_PIN, 0);    // attach pin to channel 0
+    ledcSetup(0, 2000, 8);
+
+    xTaskCreate(safetyTask, "Safety", 2048, NULL, 3, NULL);
     xTaskCreate(sensorTask, "Sensor", 2048, NULL, 2, NULL); // SENSOR TASKS
     xTaskCreate(adcTask, "ADC", 2048, NULL, 2, NULL); // TASKS
 }

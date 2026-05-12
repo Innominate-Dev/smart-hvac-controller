@@ -24,8 +24,8 @@
     {
       "type": "wokwi-buzzer",
       "id": "bz1",
-      "top": 2.4,
-      "left": -123,
+      "top": -160.8,
+      "left": -142.2,
       "attrs": { "volume": "0.1" }
     },
     {
@@ -80,7 +80,8 @@
     [ "led1:C", "esp:GND.6", "black", [ "h0" ] ],
     [ "esp:33", "r2:1", "green", [ "h0" ] ],
     [ "r2:2", "led2:A", "green", [ "h0" ] ],
-    [ "led2:C", "esp:GND.7", "black", [ "h0" ] ]
+    [ "led2:C", "esp:GND.7", "black", [ "h0" ] ],
+    [ "esp:27", "bz1:1", "green", [ "h-19.05", "v336", "h-28.8" ] ]
   ],
   "dependencies": {}
 }
