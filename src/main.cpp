@@ -2,8 +2,8 @@
 
 DHT22     -> GPIO 16
 POT       -> GPIO 34
-BUTTON 1  -> GPIO 18
-BUTTON 2  -> GPIO 19
+BUTTON 1  -> GPIO 18 -> EMERGENCY OVERRIDE (force system to reset/go in safe mode)
+BUTTON 2  -> GPIO 19 -> MODE SWITCH (turn the system on or off)
 RELAY     -> GPIO 26
 BUZZER    -> GPIO 27
 LED 1     -> GPIO 25
@@ -27,6 +27,7 @@ LED 2     -> GPIO 33
 #define LED_STATUS_PIN 25
 
 #define OVERHEAT_THRESHOLD 35.0
+#define DEBOUNCE_MS 300
 
 DHT dht(DHTPIN, DHTTYPE);
 
@@ -42,18 +43,68 @@ typedef struct {
 SystemState_t systemState;
 SemaphoreHandle_t stateMutex;
 
+volatile bool button1Pressed = false;
+volatile bool button2Pressed = false;
+volatile unsigned long lastButton1Time = 0;
+volatile unsigned long lastButton2Time = 0;
+
+// Detects for any multiple attempts and only runs once
+void IRAM_ATTR onButton1Press() {
+    unsigned long now = millis();
+   
+    if (now - lastButton1Time > DEBOUNCE_MS) {
+        button1Pressed = true;
+        lastButton1Time = now;
+    }
+}
+
+void IRAM_ATTR onButton2Press() {
+        unsigned long now = millis();
+   
+    if (now - lastButton2Time > DEBOUNCE_MS) {
+        button2Pressed = true;
+        lastButton2Time = now;
+    }
+}
+
+
 // reading whats set by the user via adc
 int readADC() {
     int raw = analogRead(POT_PIN);  // reads 0-4095
     return raw;
 }
 
-
-
 float calibrateADC(int raw) {
     // converts raw ADC to temperature setpoint 16-30 degrees
     float calibrated = (raw / 4095.0) * (30.0 - 16.0) + 16.0;
     return calibrated;
+}
+
+void buttonTask(void *pvParameters){
+    while(1){
+        if(button1Pressed){
+            button1Pressed = false;  // reset flag
+            Serial.println("Button 1: Emergency Override!");
+            // reset the alarm
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
+            systemState.alarmActive = false;
+            xSemaphoreGive(stateMutex);
+            noTone(BUZZER_PIN);
+            digitalWrite(LED_ALARM_PIN, LOW);
+        }
+
+        if (button2Pressed) {
+            button2Pressed = false;  // reset flag
+            Serial.println("Button 2: Mode Switch!");
+            // toggle relay
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
+            systemState.relayOn = !systemState.relayOn;
+            digitalWrite(RELAY_PIN, systemState.relayOn);
+            xSemaphoreGive(stateMutex);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
 void safetyTask(void *pvParameters){
@@ -63,11 +114,15 @@ void safetyTask(void *pvParameters){
         xSemaphoreGive(stateMutex);
 
         if(temp > OVERHEAT_THRESHOLD){
-            tone(BUZZER_PIN, 2000); // THIS MAKES A WARNING NOISE
+            //tone(BUZZER_PIN, 2000); 
             digitalWrite(RELAY_PIN, LOW); // Turn off our RELAY
-            // digitalWrite(LED_ALARM_PIN, HIGH); // Turn on our alarmss
-            ledcWriteTone(0, 2000);
+            digitalWrite(LED_ALARM_PIN, HIGH); // Turn on our alarmss
+            ledcWriteTone(0, 2000); // THIS MAKES A WARNING NOISE
+
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
             systemState.alarmActive = true;
+            xSemaphoreGive(stateMutex);
+
             Serial.println("WARNING: Overheating detected");
         }
         else{
@@ -140,10 +195,18 @@ void setup() {
     pinMode(BUZZER_PIN, OUTPUT);
     pinMode(LED_ALARM_PIN, OUTPUT);
     pinMode(LED_STATUS_PIN, OUTPUT);
+    pinMode(18, INPUT_PULLUP);
+    pinMode(19, INPUT_PULLUP);
 
     ledcAttachPin(BUZZER_PIN, 0);    // attach pin to channel 0
     ledcSetup(0, 2000, 8);
 
+
+
+    attachInterrupt(digitalPinToInterrupt(18), onButton1Press, FALLING);
+    attachInterrupt(digitalPinToInterrupt(19), onButton2Press, FALLING);
+
+    xTaskCreate(buttonTask, "Buttons", 2048, NULL, 2, NULL);
     xTaskCreate(safetyTask, "Safety", 2048, NULL, 3, NULL);
     xTaskCreate(sensorTask, "Sensor", 2048, NULL, 2, NULL); // SENSOR TASKS
     xTaskCreate(adcTask, "ADC", 2048, NULL, 2, NULL); // TASKS
