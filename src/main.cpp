@@ -15,6 +15,7 @@ LED 2     -> GPIO 33
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "DHT.h"
+#include "freertos/semphr.h"
 
 #define DHTTYPE DHT22
 #define DHTPIN 16
@@ -32,6 +33,7 @@ typedef struct {
 } SystemState_t;
 
 SystemState_t systemState;
+SemaphoreHandle_t stateMutex;
 
 // reading whats set by the user via adc
 int readADC() {
@@ -52,16 +54,18 @@ void sensorTask(void *pvParameters) {
         Serial.println("Reading sensor...");
 
         float temperature, humidity;
-
+        xSemaphoreTake(stateMutex, portMAX_DELAY); //locking so one thread can access our data
         systemState.humidity = dht.readHumidity();
         systemState.temperature = dht.readTemperature();
-
+        
         if (isnan(systemState.temperature) || isnan(systemState.humidity)) 
         {
             Serial.println("ERROR: Sensor read failed!");
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
+        
+        xSemaphoreGive(stateMutex); // unlocking
 
         Serial.print("Humidity: ");
         Serial.println(systemState.humidity);
@@ -76,8 +80,10 @@ void sensorTask(void *pvParameters) {
 
 void adcTask(void *pvParameters) {
     while(1) {
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
         systemState.adcRaw = readADC();
         systemState.setpoint = calibrateADC(systemState.adcRaw);
+        xSemaphoreGive(stateMutex);
 
         Serial.print("ADC Raw: ");
         Serial.println(systemState.adcRaw);
@@ -90,6 +96,7 @@ void adcTask(void *pvParameters) {
 }
 
 void setup() {
+    stateMutex = xSemaphoreCreateMutex();
     Serial.begin(115200);
     dht.begin();
     xTaskCreate(sensorTask, "Sensor", 2048, NULL, 2, NULL); // SENSOR TASKS
