@@ -40,6 +40,7 @@ typedef struct {
     float setpoint;
     bool relayOn;
     bool alarmActive;
+    bool systemShutdown;
     int failureCount;
     float lastTemperature;
 } SystemState_t;
@@ -53,6 +54,8 @@ volatile unsigned long lastButton1Time = 0;
 volatile unsigned long lastButton2Time = 0;
 
 bool firstReading = true;
+
+static bool ledState = false; 
 
 // Detects for any multiple attempts and only runs once
 void IRAM_ATTR onButton1Press() {
@@ -89,29 +92,37 @@ float calibrateADC(int raw) {
 void buttonTask(void *pvParameters){
     while(1){
         if(button1Pressed){
-            button1Pressed = false;  // reset flag
-            Serial.println("Button 1: Emergency Override!");
-            // reset the alarm
+            button1Pressed = false;
+            Serial.println("Button 1: Emergency Shutdown!");
+
             xSemaphoreTake(stateMutex, portMAX_DELAY);
-            systemState.alarmActive = false;
+            firstReading = true;
+            systemState.failureCount = 0;
+            systemState.alarmActive = true;
+            systemState.systemShutdown = true;
+            systemState.relayOn = false;
             xSemaphoreGive(stateMutex);
-            noTone(BUZZER_PIN);
-            digitalWrite(LED_ALARM_PIN, LOW);
+
+            digitalWrite(RELAY_PIN, LOW);
+            ledcWriteTone(0, 2000);
+            digitalWrite(LED_ALARM_PIN, HIGH);
         }
 
-        if (button2Pressed) {
-            button2Pressed = false;  // reset flag
-            Serial.println("Button 2: Mode Switch!");
+        if(button2Pressed){
+            button2Pressed = false;
+            Serial.println("Button 2: System Reset!");
 
             xSemaphoreTake(stateMutex, portMAX_DELAY);
+            firstReading = true;
             systemState.failureCount = 0;
+            systemState.alarmActive = false;
+            systemState.systemShutdown = false;
+            systemState.relayOn = true;
             xSemaphoreGive(stateMutex);
 
-            // toggles relay //
-            xSemaphoreTake(stateMutex, portMAX_DELAY);
-            systemState.relayOn = !systemState.relayOn;
-            digitalWrite(RELAY_PIN, systemState.relayOn);
-            xSemaphoreGive(stateMutex);
+            digitalWrite(RELAY_PIN, HIGH);
+            ledcWriteTone(0, 0);
+            digitalWrite(LED_ALARM_PIN, LOW);
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -122,15 +133,25 @@ void safetyTask(void *pvParameters){
     esp_task_wdt_add(NULL);
     while(1) {
         if(xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE){
+
+            if(systemState.systemShutdown){
+                xSemaphoreGive(stateMutex);
+                esp_task_wdt_reset();
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+
             float temp = systemState.temperature;
             xSemaphoreGive(stateMutex);
 
             if(temp > OVERHEAT_THRESHOLD){
+
                 digitalWrite(RELAY_PIN, LOW); // Turn off our RELAY
                 digitalWrite(LED_ALARM_PIN, HIGH); // Turn on our alarmss
                 ledcWriteTone(0, 2000); // THIS MAKES A WARNING NOISE
 
                 xSemaphoreTake(stateMutex, portMAX_DELAY);
+                systemState.relayOn = false;
                 systemState.alarmActive = true;
                 xSemaphoreGive(stateMutex);
 
@@ -138,13 +159,30 @@ void safetyTask(void *pvParameters){
             }
             else{
                 ledcWriteTone(0, 0); // Turns off Our ALARM
-                digitalWrite(RELAY_PIN, HIGH); // Turn off our RELAY
-                digitalWrite(LED_ALARM_PIN, LOW); // Turn on our LED alarmss
+                digitalWrite(RELAY_PIN, HIGH); // Turn on our RELAY
+                digitalWrite(LED_ALARM_PIN, LOW); // Turn off our LED alarmss
 
                 xSemaphoreTake(stateMutex, portMAX_DELAY);
+                if(!systemState.systemShutdown){systemState.relayOn = true;}
                 systemState.alarmActive = false;
                 xSemaphoreGive(stateMutex);
             }
+            
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
+            if(systemState.alarmActive || systemState.systemShutdown){
+                // alarm or shutdown - LED OFF
+                digitalWrite(LED_STATUS_PIN, LOW);
+
+            } else if(systemState.relayOn){
+                // relay on, normal operation SOLID COLOUR
+                digitalWrite(LED_STATUS_PIN, HIGH);
+
+            } else {
+                // relay manually switched off - START BLINKING
+                ledState = !ledState;
+                digitalWrite(LED_STATUS_PIN, ledState);
+            }
+            xSemaphoreGive(stateMutex);
 
         }
         esp_task_wdt_reset();
@@ -155,6 +193,16 @@ void safetyTask(void *pvParameters){
 void sensorTask(void *pvParameters) {
     
     while(1) {
+
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        bool isShutdown = systemState.systemShutdown;
+        xSemaphoreGive(stateMutex);
+
+        if(isShutdown){
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
         Serial.println("Reading sensor...");
         
         float temperature, humidity;
@@ -174,17 +222,22 @@ void sensorTask(void *pvParameters) {
         // check for failed reading
         if (isnan(systemState.temperature) || isnan(systemState.humidity)) {
             systemState.failureCount++;
-            xSemaphoreGive(stateMutex);
             Serial.println("ERROR: Sensor read failed!");
 
             // check if too many failures
             if (systemState.failureCount >= MAX_FAILURE) {
                 Serial.println("CRITICAL: Too many failures - shutting down!");
                 digitalWrite(RELAY_PIN, LOW);
+                systemState.relayOn = false;
+                systemState.systemShutdown = true;
+                systemState.alarmActive = true;
+                xSemaphoreGive(stateMutex);
                 ledcWriteTone(0, 2000);
                 digitalWrite(LED_ALARM_PIN, HIGH);
+                continue;
             }
 
+            xSemaphoreGive(stateMutex);
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
@@ -195,6 +248,19 @@ void sensorTask(void *pvParameters) {
             Serial.println("WARNING: Anomoly detected - Rejecting sensor reading");
             systemState.temperature = systemState.lastTemperature;
             systemState.failureCount++;
+
+            if(systemState.failureCount >= MAX_FAILURE){
+                Serial.println("CRITICAL: Too many anomalies - shutting down!");
+                digitalWrite(RELAY_PIN, LOW);
+                systemState.relayOn = false;
+                systemState.systemShutdown = true;
+                systemState.alarmActive = true;
+                ledcWriteTone(0, 2000);
+                digitalWrite(LED_ALARM_PIN, HIGH);
+                xSemaphoreGive(stateMutex);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                continue;
+            }
         }
         else{
             systemState.failureCount = 0;
@@ -215,6 +281,16 @@ void sensorTask(void *pvParameters) {
 
 void adcTask(void *pvParameters) {
     while(1) {
+        
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        bool isShutdown = systemState.systemShutdown;
+        xSemaphoreGive(stateMutex);
+
+        if(isShutdown){
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
         xSemaphoreTake(stateMutex, portMAX_DELAY);
         systemState.adcRaw = readADC();
         systemState.setpoint = calibrateADC(systemState.adcRaw);
@@ -242,9 +318,13 @@ void setup() {
     pinMode(18, INPUT_PULLUP);
     pinMode(19, INPUT_PULLUP);
 
-    ledcAttachPin(BUZZER_PIN, 0);    // attach pin to channel 0
     ledcSetup(0, 2000, 8);
+    ledcAttachPin(BUZZER_PIN, 0);    // attach pin to channel 0
 
+    systemState.systemShutdown = false;
+    systemState.relayOn = true;
+    systemState.alarmActive = false;
+    systemState.failureCount = 0;
 
     esp_task_wdt_init(10, true);
 
