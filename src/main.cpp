@@ -16,6 +16,7 @@ LED 2     -> GPIO 33
 #include "freertos/task.h"
 #include "DHT.h"
 #include "freertos/semphr.h"
+#include "esp_task_wdt.h"
 
 // Defining our pin ports
 #define DHTTYPE DHT22
@@ -50,6 +51,8 @@ volatile bool button1Pressed = false;
 volatile bool button2Pressed = false;
 volatile unsigned long lastButton1Time = 0;
 volatile unsigned long lastButton2Time = 0;
+
+bool firstReading = true;
 
 // Detects for any multiple attempts and only runs once
 void IRAM_ATTR onButton1Press() {
@@ -116,49 +119,57 @@ void buttonTask(void *pvParameters){
 }
 
 void safetyTask(void *pvParameters){
+    esp_task_wdt_add(NULL);
     while(1) {
-
-        xSemaphoreTake(stateMutex, portMAX_DELAY);
-        float temp = systemState.temperature;
-        xSemaphoreGive(stateMutex);
-
-        if(temp > OVERHEAT_THRESHOLD){
-            //tone(BUZZER_PIN, 2000); 
-            digitalWrite(RELAY_PIN, LOW); // Turn off our RELAY
-            digitalWrite(LED_ALARM_PIN, HIGH); // Turn on our alarmss
-            ledcWriteTone(0, 2000); // THIS MAKES A WARNING NOISE
-
-            xSemaphoreTake(stateMutex, portMAX_DELAY);
-            systemState.alarmActive = true;
+        if(xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE){
+            float temp = systemState.temperature;
             xSemaphoreGive(stateMutex);
 
-            Serial.println("WARNING: Overheating detected");
-        }
-        else{
-            // noTone(BUZZER_PIN); // //Turns off alarm
-            ledcWriteTone(0, 0);
-            digitalWrite(RELAY_PIN, HIGH); // Turn off our RELAY
-            digitalWrite(LED_ALARM_PIN, LOW); // Turn on our alarmss
+            if(temp > OVERHEAT_THRESHOLD){
+                digitalWrite(RELAY_PIN, LOW); // Turn off our RELAY
+                digitalWrite(LED_ALARM_PIN, HIGH); // Turn on our alarmss
+                ledcWriteTone(0, 2000); // THIS MAKES A WARNING NOISE
 
-            xSemaphoreTake(stateMutex, portMAX_DELAY);
-            systemState.alarmActive = false;
-            xSemaphoreGive(stateMutex);
+                xSemaphoreTake(stateMutex, portMAX_DELAY);
+                systemState.alarmActive = true;
+                xSemaphoreGive(stateMutex);
+
+                Serial.println("WARNING: Overheating detected");
+            }
+            else{
+                ledcWriteTone(0, 0); // Turns off Our ALARM
+                digitalWrite(RELAY_PIN, HIGH); // Turn off our RELAY
+                digitalWrite(LED_ALARM_PIN, LOW); // Turn on our LED alarmss
+
+                xSemaphoreTake(stateMutex, portMAX_DELAY);
+                systemState.alarmActive = false;
+                xSemaphoreGive(stateMutex);
+            }
+
         }
+        esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
 void sensorTask(void *pvParameters) {
+    
     while(1) {
         Serial.println("Reading sensor...");
         
         float temperature, humidity;
         xSemaphoreTake(stateMutex, portMAX_DELAY); //locking so one thread can access our data
+
         systemState.lastTemperature = systemState.temperature;
 
         systemState.humidity = dht.readHumidity();
         systemState.temperature = dht.readTemperature();
 
+        if(firstReading){
+            systemState.lastTemperature = systemState.temperature;
+            firstReading = false;
+        }
+        
 
         // check for failed reading
         if (isnan(systemState.temperature) || isnan(systemState.humidity)) {
@@ -182,9 +193,8 @@ void sensorTask(void *pvParameters) {
         if (abs(systemState.lastTemperature - systemState.temperature) > 10 )
         {
             Serial.println("WARNING: Anomoly detected - Rejecting sensor reading");
-            xSemaphoreTake(stateMutex, portMAX_DELAY);
             systemState.temperature = systemState.lastTemperature;
-            xSemaphoreGive(stateMutex);
+            systemState.failureCount++;
         }
         else{
             systemState.failureCount = 0;
@@ -216,7 +226,7 @@ void adcTask(void *pvParameters) {
         Serial.print(systemState.setpoint);
         Serial.println(" C");
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(1500));
     }
 }
 
@@ -236,6 +246,7 @@ void setup() {
     ledcSetup(0, 2000, 8);
 
 
+    esp_task_wdt_init(10, true);
 
     attachInterrupt(digitalPinToInterrupt(18), onButton1Press, FALLING);
     attachInterrupt(digitalPinToInterrupt(19), onButton2Press, FALLING);
