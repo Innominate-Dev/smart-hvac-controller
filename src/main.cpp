@@ -59,7 +59,7 @@ float calibrateADC(int raw) {
 void safetyTask(void *pvParameters){
     while(1) {
         xSemaphoreTake(stateMutex, portMAX_DELAY);
-        float temp = 40.0;
+        float temp = systemState.temperature;
         xSemaphoreGive(stateMutex);
 
         if(temp > OVERHEAT_THRESHOLD){
